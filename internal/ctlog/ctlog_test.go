@@ -109,44 +109,71 @@ func TestSequenceEmptyPool(t *testing.T) {
 	sequenceTwice(tl)
 }
 
-func TestSequenceUploadCount(t *testing.T) {
+func counter(source *uint64) func() uint64 {
+	var old uint64
+	counter := func() uint64 {
+		new := *source
+		n := new - old
+		old = new
+		return n
+	}
+	counter()
+	return counter
+}
+
+func TestSequenceUploadCopyCount(t *testing.T) {
 	tl := NewEmptyTestLog(t)
 	for i := 0; i < tileWidth+1; i++ {
 		addCertificate(t, tl)
 	}
 	fatalIfErr(t, tl.Log.Sequence())
 
-	var old uint64
-	uploads := func() uint64 {
-		new := tl.Config.Backend.(*MemoryBackend).uploads
-		n := new - old
-		old = new
-		return n
-	}
-	uploads()
+	uploads := counter(&tl.Config.Backend.(*MemoryBackend).uploads)
+	copies := counter(&tl.Config.Backend.(*MemoryBackend).copies)
+	deletes := counter(&tl.Config.Backend.(*MemoryBackend).deletes)
 
-	// Empty rounds should cause only one upload (the checkpoint).
+	// Empty rounds should cause only one upload (the checkpoint) and no copies.
 	fatalIfErr(t, tl.Log.Sequence())
 	if n := uploads(); n != 1 {
 		t.Errorf("got %d uploads, expected 1", n)
 	}
+	if n := copies(); n != 0 {
+		t.Errorf("got %d copies, expected 0", n)
+	}
+	if n := deletes(); n != 0 {
+		t.Errorf("got %d deletes, expected 0", n)
+	}
 
 	// One entry in steady state (not at tile boundary) should cause three
-	// uploads (the checkpoint, a level -1 tile, and a level 0 tile).
+	// uploads (the checkpoint, and files for a level -1 tile, and a level 0
+	// tile), and two copies and deletes (one for each tile).
 	addCertificate(t, tl)
 	fatalIfErr(t, tl.Log.Sequence())
 	if n := uploads(); n != 3 {
 		t.Errorf("got %d uploads, expected 3", n)
 	}
+	if n := copies(); n != 2 {
+		t.Errorf("got %d copies, expected 2", n)
+	}
+	if n := deletes(); n != 2 {
+		t.Errorf("got %d deletes, expected 2", n)
+	}
 
 	// A tile width worth of entries should cause six uploads (the checkpoint,
-	// two level -1 tiles, two level 0 tiles, and one level 1 tile).
+	// and files for two level -1 tiles, two level 0 tiles, and one level 1
+	// tile), and five copies and deletes (one for each tile).
 	for i := 0; i < tileWidth; i++ {
 		addCertificate(t, tl)
 	}
 	fatalIfErr(t, tl.Log.Sequence())
 	if n := uploads(); n != 6 {
 		t.Errorf("got %d uploads, expected 6", n)
+	}
+	if n := copies(); n != 5 {
+		t.Errorf("got %d copies, expected 5", n)
+	}
+	if n := deletes(); n != 5 {
+		t.Errorf("got %d deletes, expected 5", n)
 	}
 }
 
@@ -257,6 +284,45 @@ func testReloadLog(t *testing.T, add func(*testing.T, *TestLog) func(context.Con
 		tl = ReloadLog(t, tl)
 		fatalIfErr(t, tl.Log.Sequence())
 		tl.CheckLog()
+	}
+}
+
+func TestRecoverLog(t *testing.T) {
+	tl := NewEmptyTestLog(t)
+	n := int64(tileWidth + 2)
+	if testing.Short() {
+		n = 3
+	} else {
+		tl.Quiet()
+	}
+	for i := int64(0); i < n; i++ {
+		addCertificateFast(t, tl)
+
+		ctlog.SetFailCopyPending(true)
+		if err := tl.Log.Sequence(); err == nil {
+			t.Fatal("expected sequencer failure")
+		}
+		ctlog.SetFailCopyPending(false)
+
+		pending, err := tl.Config.Backend.List(context.Background(), "pending/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) == 0 {
+			t.Errorf("expected non-zero pending files before recovery, got %d", len(pending))
+		}
+
+		tl = ReloadLog(t, tl)
+		fatalIfErr(t, tl.Log.Sequence())
+		tl.CheckLog()
+
+		pending, err = tl.Config.Backend.List(context.Background(), "pending/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pending) != 0 {
+			t.Errorf("expected 0 pending files after recovery, got %d", len(pending))
+		}
 	}
 }
 
