@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -322,7 +323,7 @@ type MemoryBackend struct {
 	mu sync.Mutex
 	m  map[string][]byte
 
-	uploads uint64
+	uploads, deletes uint64
 }
 
 func NewMemoryBackend(t testing.TB) *MemoryBackend {
@@ -357,6 +358,32 @@ func (b *MemoryBackend) Fetch(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("key %q not found", key)
 	}
 	return data, nil
+}
+
+func (b *MemoryBackend) Delete(ctx context.Context, key string) error {
+	atomic.AddUint64(&b.deletes, 1)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.m[key]; !ok {
+		return fmt.Errorf("key %q not found", key)
+	}
+	delete(b.m, key)
+	return nil
+}
+
+func (b *MemoryBackend) countPending() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	count := 0
+	for key := range b.m {
+		if strings.HasPrefix(key, "pending/") {
+			count++
+		}
+	}
+	return count
 }
 
 func (b *MemoryBackend) Metrics() []prometheus.Collector { return nil }

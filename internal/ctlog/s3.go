@@ -217,6 +217,19 @@ func (s *S3Backend) Fetch(ctx context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
+func (s *S3Backend) Delete(ctx context.Context, key string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.keyPrefix + key),
+	})
+	if err != nil {
+		s.log.DebugContext(ctx, "S3 DELETE", "key", key, "err", err)
+		return fmtErrorf("failed to delete %q from S3: %w", key, err)
+	}
+	s.log.DebugContext(ctx, "S3 DELETE", "key", key)
+	return nil
+}
+
 func (s *S3Backend) Metrics() []prometheus.Collector {
 	return s.metrics
 }
