@@ -14,6 +14,7 @@ import (
 	"maps"
 	"math"
 	"math/rand"
+	"strings"
 	"sync"
 	"time"
 
@@ -141,6 +142,44 @@ func CreateLog(ctx context.Context, config *Config) error {
 	return nil
 }
 
+var testOnlyFailCopyPending bool
+
+func copyPending(ctx context.Context, config *Config, checkpoint []byte, tree tlog.Tree) error {
+	if testOnlyFailCopyPending {
+		return errors.Join(errFatal, errors.New("failing copy for test"))
+	}
+
+	prefix := fmt.Sprintf("pending/%d/%s/", tree.N, tree.Hash)
+	config.Log.DebugContext(ctx, "copying pending files", "prefix", prefix)
+
+	paths, err := config.Backend.List(ctx, prefix)
+	if err != nil {
+		return fmt.Errorf("couldn't list pending files: %w", err)
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+	defer g.Wait()
+	for _, path := range paths {
+		g.Go(func() error {
+			finalPath := strings.TrimPrefix(path, prefix)
+			if err := config.Backend.Copy(gctx, path, finalPath); err != nil {
+				return fmtErrorf("couldn't copy a tile: %w", err)
+			}
+			return config.Backend.Delete(gctx, path)
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	config.Log.DebugContext(ctx, "uploading checkpoint", "prefix", prefix)
+	if err := config.Backend.Upload(ctx, "checkpoint", checkpoint, optsText); err != nil {
+		return fmtErrorf("couldn't upload checkpoint to object storage: %w", err)
+	}
+
+	return nil
+}
+
 func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 	pkix, err := x509.MarshalPKIXPublicKey(config.Key.Public())
 	if err != nil {
@@ -207,11 +246,12 @@ func LoadLog(ctx context.Context, config *Config) (*Log, error) {
 	if c1.N < c.N {
 		// It's possible that we crashed between committing a new checkpoint to
 		// the lock backend and uploading it to the object storage backend.
-		// Or maybe the object storage backend GETs are cached.
-		// That's ok, as long as the rest of the tree load correctly against the
-		// lock checkpoint.
 		config.Log.WarnContext(ctx, "checkpoint in object storage is older than lock checkpoint",
 			"old_size", c1.N, "size", c.N)
+		if err := copyPending(ctx, config, lock.Bytes(), c.Tree); err != nil {
+			return nil, fmt.Errorf("copying pending files failed: %w", err)
+		}
+		config.Log.DebugContext(ctx, "copied pending files")
 	}
 
 	pemIssuers, err := config.Backend.Fetch(ctx, "issuers.pem")
@@ -320,6 +360,16 @@ type Backend interface {
 	// Fetch can be called concurrently. It's expected to decompress any data
 	// uploaded with UploadOptions.Compress true.
 	Fetch(ctx context.Context, key string) ([]byte, error)
+
+	// List returns all keys with a given prefix. The prefix is included in the
+	// returned keys.
+	List(ctx context.Context, prefix string) ([]string, error)
+
+	// Copy copies a file. The upload options from the original upload are maintained.
+	Copy(ctx context.Context, from, to string) error
+
+	// Delete deletes a file.
+	Delete(ctx context.Context, key string) error
 
 	// Metrics returns the metrics to register for this log. The metrics should
 	// not be shared by any other logs.
@@ -662,6 +712,11 @@ func (l *Log) sequence(ctx context.Context) error {
 	return l.sequencePool(ctx, p)
 }
 
+type pendingFile struct {
+	data []byte
+	opts *UploadOptions
+}
+
 func (l *Log) sequencePool(ctx context.Context, p *pool) (err error) {
 	oldSize := l.tree.N
 	defer prometheus.NewTimer(l.m.SeqDuration).ObserveDuration()
@@ -689,13 +744,12 @@ func (l *Log) sequencePool(ctx context.Context, p *pool) (err error) {
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(ctx, sequenceTimeout)
 	defer cancel()
-	g, gctx := errgroup.WithContext(ctx)
-	defer g.Wait()
-
 	timestamp := timeNowUnixMilli()
 	if timestamp <= l.tree.Time {
 		return errors.Join(errFatal, fmtErrorf("time did not progress! %d -> %d", l.tree.Time, timestamp))
 	}
+
+	pendingFiles := make(map[string]*pendingFile)
 
 	edgeTiles := maps.Clone(l.edgeTiles)
 	var dataTile []byte
@@ -737,8 +791,7 @@ func (l *Log) sequencePool(ctx context.Context, p *pool) (err error) {
 				"tree_size", n, "tile", tile, "size", len(dataTile))
 			l.m.SeqDataTileSize.Observe(float64(len(dataTile)))
 			tileCount++
-			data := dataTile // data is captured by the g.Go function.
-			g.Go(func() error { return l.c.Backend.Upload(gctx, tile.Path(), data, optsDataTile) })
+			pendingFiles[tile.Path()] = &pendingFile{data: dataTile, opts: optsDataTile}
 			dataTile = nil
 		}
 	}
@@ -752,13 +805,12 @@ func (l *Log) sequencePool(ctx context.Context, p *pool) (err error) {
 			"tree_size", n, "tile", tile, "size", len(dataTile))
 		l.m.SeqDataTileSize.Observe(float64(len(dataTile)))
 		tileCount++
-		g.Go(func() error { return l.c.Backend.Upload(gctx, tile.Path(), dataTile, optsDataTile) })
+		pendingFiles[tile.Path()] = &pendingFile{data: dataTile, opts: optsDataTile}
 	}
 
 	// Produce and upload new tree tiles.
 	tiles := tlog.NewTiles(TileHeight, l.tree.N, n)
 	for _, tile := range tiles {
-		tile := tile // tile is captured by the g.Go function.
 		data, err := tlog.ReadTileData(tile, hashReader)
 		if err != nil {
 			return fmtErrorf("couldn't generate tile %v: %w", tile, err)
@@ -771,11 +823,7 @@ func (l *Log) sequencePool(ctx context.Context, p *pool) (err error) {
 		l.c.Log.DebugContext(ctx, "uploading tree tile", "old_tree_size", oldSize,
 			"tree_size", n, "tile", tile, "size", len(data))
 		tileCount++
-		g.Go(func() error { return l.c.Backend.Upload(gctx, tile.Path(), data, optsHashTile) })
-	}
-
-	if err := g.Wait(); err != nil {
-		return fmtErrorf("couldn't upload a tile: %w", err)
+		pendingFiles[tile.Path()] = &pendingFile{data: data, opts: optsHashTile}
 	}
 
 	if testingOnlyPauseSequencing != nil {
@@ -787,6 +835,18 @@ func (l *Log) sequencePool(ctx context.Context, p *pool) (err error) {
 		return fmtErrorf("couldn't compute tree hash: %w", err)
 	}
 	tree := treeWithTimestamp{Tree: tlog.Tree{N: n, Hash: rootHash}, Time: timestamp}
+
+	// Write all pending tiles for the new tree.
+	// TODO: use URL encoding for the hash instead?
+	pendingPrefix := fmt.Sprintf("pending/%d/%s/", tree.N, tree.Hash.String())
+	g, gctx := errgroup.WithContext(ctx)
+	defer g.Wait()
+	for path, file := range pendingFiles {
+		g.Go(func() error { return l.c.Backend.Upload(gctx, pendingPrefix+path, file.data, file.opts) })
+	}
+	if err := g.Wait(); err != nil {
+		return fmtErrorf("couldn't upload a tile: %w", err)
+	}
 
 	checkpoint, err := signTreeHead(l.c.Name, l.logID, l.c.Key, tree)
 	if err != nil {
@@ -812,10 +872,11 @@ func (l *Log) sequencePool(ctx context.Context, p *pool) (err error) {
 	l.lockCheckpoint = newLock
 	l.edgeTiles = edgeTiles
 
-	if err := l.c.Backend.Upload(ctx, "checkpoint", checkpoint, optsText); err != nil {
-		// Return an error so we don't produce SCTs that, although safely
-		// serialized, wouldn't be part of a publicly visible tree.
-		return fmtErrorf("couldn't upload checkpoint to object storage: %w", err)
+	// Copy the pending tiles to their final location.
+	if err := copyPending(ctx, l.c, checkpoint, tree.Tree); err != nil {
+		// Return an error so we don't produce SCTs that, although committed,
+		// aren't yet part of a publicly visible tree.
+		return fmtErrorf("couldn't copy pending files to object storage: %w", err)
 	}
 
 	// At this point if the cache put fails, there's no reason to return errors

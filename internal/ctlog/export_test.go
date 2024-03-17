@@ -26,3 +26,7 @@ func PauseSequencer() {
 func ResumeSequencer() {
 	close(seqRunning)
 }
+
+func SetFailCopyPending(fail bool) {
+	testOnlyFailCopyPending = fail
+}

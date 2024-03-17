@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -215,6 +216,62 @@ func (s *S3Backend) Fetch(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmtErrorf("failed to read %q from S3: %w", key, err)
 	}
 	return data, nil
+}
+
+func (s *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
+	out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket: aws.String(s.bucket),
+		Prefix: aws.String(s.keyPrefix + prefix),
+	})
+	if err != nil {
+		s.log.DebugContext(ctx, "S3 LIST", "prefix", prefix, "err", err)
+		return nil, fmtErrorf("failed to list %q from S3: %w", prefix, err)
+	}
+	s.log.DebugContext(ctx, "S3 LIST", "prefix", prefix,
+		"count", len(out.Contents))
+
+	var keys []string
+	for _, object := range out.Contents {
+		if object.Key == nil {
+			return nil, fmtErrorf("failed to list %q from S3: nil key", prefix)
+		}
+		key := *object.Key
+		if !strings.HasPrefix(key, s.keyPrefix+prefix) {
+			return nil, fmtErrorf("failed to list %q from S3: strange response %q", prefix, key)
+		}
+		keys = append(keys, strings.TrimPrefix(key, s.keyPrefix))
+	}
+	if out.IsTruncated != nil && *out.IsTruncated {
+		return nil, fmtErrorf("failed to list %q from S3: response truncated", prefix)
+	}
+	return keys, nil
+}
+
+func (s *S3Backend) Copy(ctx context.Context, from, to string) error {
+	_, err := s.client.CopyObject(ctx, &s3.CopyObjectInput{
+		Bucket:     aws.String(s.bucket),
+		CopySource: aws.String(s.bucket + "/" + s.keyPrefix + from),
+		Key:        aws.String(s.keyPrefix + to),
+	})
+	if err != nil {
+		s.log.DebugContext(ctx, "S3 COPY", "from", from, "to", to, "err", err)
+		return fmtErrorf("failed to copy %q to %q on S3: %w", from, to, err)
+	}
+	s.log.DebugContext(ctx, "S3 COPY", "from", from, "to", to)
+	return nil
+}
+
+func (s *S3Backend) Delete(ctx context.Context, key string) error {
+	_, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(s.keyPrefix + key),
+	})
+	if err != nil {
+		s.log.DebugContext(ctx, "S3 DELETE", "key", key, "err", err)
+		return fmtErrorf("failed to delete %q from S3: %w", key, err)
+	}
+	s.log.DebugContext(ctx, "S3 DELETE", "key", key)
+	return nil
 }
 
 func (s *S3Backend) Metrics() []prometheus.Collector {

@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -322,7 +323,7 @@ type MemoryBackend struct {
 	mu sync.Mutex
 	m  map[string][]byte
 
-	uploads uint64
+	uploads, copies, deletes uint64
 }
 
 func NewMemoryBackend(t testing.TB) *MemoryBackend {
@@ -357,6 +358,50 @@ func (b *MemoryBackend) Fetch(ctx context.Context, key string) ([]byte, error) {
 		return nil, fmt.Errorf("key %q not found", key)
 	}
 	return data, nil
+}
+
+func (b *MemoryBackend) List(ctx context.Context, prefix string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var keys []string
+	for key := range b.m {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	return keys, nil
+}
+
+func (b *MemoryBackend) Copy(ctx context.Context, from, to string) error {
+	atomic.AddUint64(&b.copies, 1)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	data, ok := b.m[from]
+	if !ok {
+		return fmt.Errorf("key %q not found", from)
+	}
+	b.m[to] = data
+	return nil
+}
+
+func (b *MemoryBackend) Delete(ctx context.Context, key string) error {
+	atomic.AddUint64(&b.deletes, 1)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.m[key]; !ok {
+		return fmt.Errorf("key %q not found", key)
+	}
+	delete(b.m, key)
+	return nil
 }
 
 func (b *MemoryBackend) Metrics() []prometheus.Collector { return nil }
