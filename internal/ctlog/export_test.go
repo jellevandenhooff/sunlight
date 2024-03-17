@@ -26,3 +26,7 @@ func PauseSequencer() {
 func ResumeSequencer() {
 	close(seqRunning)
 }
+
+func SetFailUploadPending(fail bool) {
+	testOnlyFailUploadPending = fail
+}
